@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Benchmark Kafka vs RabbitMQ — Dashboard Temps Réel</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --kafka-color:  #e74c3c;
+      --rabbit-color: #f39c12;
+      --bg:           #0f1117;
+      --card:         #1a1d27;
+      --border:       #2a2d3e;
+      --text:         #e0e0e0;
+      --muted:        #8892a4;
+      --green:        #2ecc71;
+      --red:          #e74c3c;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 700; }
+    header h1 span.kafka  { color: var(--kafka-color); }
+    header h1 span.rabbit { color: var(--rabbit-color); }
+    #last-update { font-size: 0.8rem; color: var(--muted); }
+
+    /* ── Verdict Banner ── */
+    #verdict-banner {
+      margin: 1.5rem 2rem 0;
+      padding: 1rem 1.5rem;
+      border-radius: 10px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      display: none;
+    }
+    #verdict-banner.visible { display: block; }
+    #verdict-banner h2 { font-size: 1rem; color: var(--muted); margin-bottom: 0.5rem; }
+    #verdict-summary { font-size: 1.05rem; font-weight: 600; }
+    .score-row {
+      display: flex;
+      gap: 2rem;
+      margin-top: 0.8rem;
+    }
+    .score-pill {
+      padding: 0.3rem 1rem;
+      border-radius: 20px;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+    .score-pill.kafka  { background: rgba(231,76,60,0.2);  color: var(--kafka-color); }
+    .score-pill.rabbit { background: rgba(243,156,18,0.2); color: var(--rabbit-color); }
+    .verdict-details {
+      display: flex;
+      gap: 1rem;
+      margin-top: 0.8rem;
+      flex-wrap: wrap;
+    }
+    .verdict-metric {
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 0.4rem 0.8rem;
+      font-size: 0.82rem;
+    }
+    .verdict-metric .winner-badge {
+      font-weight: 700;
+      margin-right: 0.3rem;
+    }
+    .winner-kafka  { color: var(--kafka-color); }
+    .winner-rabbit { color: var(--rabbit-color); }
+
+    /* ── Main grid ── */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      padding: 1.5rem 2rem;
+    }
+
+    /* ── Pipeline card ── */
+    .pipeline-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .pipeline-card h2 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin-bottom: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .dot.kafka  { background: var(--kafka-color); }
+    .dot.rabbit { background: var(--rabbit-color); }
+
+    /* ── Metric tiles ── */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.8rem;
+      margin-bottom: 1.2rem;
+    }
+    .metric-tile {
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 0.8rem 1rem;
+    }
+    .metric-tile .label {
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.3rem;
+    }
+    .metric-tile .value {
+      font-size: 1.6rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .metric-tile .unit {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-left: 0.2rem;
+    }
+
+    /* ── Producers status ── */
+    .producers-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+      font-size: 0.85rem;
+    }
+    .prod-indicator {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .prod-indicator.active   { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .prod-indicator.inactive { background: var(--red); }
+
+    /* ── Charts section ── */
+    .charts-section {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.2rem 1.5rem;
+    }
+    .chart-card h3 {
+      font-size: 0.9rem;
+      color: var(--muted);
+      margin-bottom: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    canvas { max-height: 220px; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .main-grid, .charts-section { grid-template-columns: 1fr; }
+      .charts-section { grid-column: 1; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ Benchmark <span class="kafka">Kafka / Flink</span> vs <span class="rabbit">RabbitMQ</span></h1>
+  <span id="last-update">Chargement...</span>
+</header>
+
+<!-- Verdict Banner -->
+<div id="verdict-banner">
+  <h2>🏆 VERDICT AUTOMATIQUE</h2>
+  <div id="verdict-summary">—</div>
+  <div class="score-row">
+    <span class="score-pill kafka"  id="kafka-score">Kafka: 0/3</span>
+    <span class="score-pill rabbit" id="rabbit-score">RabbitMQ: 0/3</span>
+  </div>
+  <div class="verdict-details" id="verdict-details"></div>
+</div>
+
+<!-- Main Grid -->
+<div class="main-grid">
+
+  <!-- Kafka Card -->
+  <div class="pipeline-card">
+    <h2><span class="dot kafka"></span> Kafka / Flink</h2>
+    <div class="producers-row">
+      <span class="prod-indicator" id="kafka-prod-dot"></span>
+      <span id="kafka-prod-label">Producteurs: —</span>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-tile">
+        <div class="label">Débit</div>
+        <div class="value" id="kafka-throughput">—<span class="unit">msg/s</span></div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Latence moy.</div>
+        <div class="value" id="kafka-latency">—<span class="unit">ms</span></div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Total traités</div>
+        <div class="value" id="kafka-total">—</div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Messages perdus</div>
+        <div class="value" id="kafka-lost">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RabbitMQ Card -->
+  <div class="pipeline-card">
+    <h2><span class="dot rabbit"></span> RabbitMQ</h2>
+    <div class="producers-row">
+      <span class="prod-indicator" id="rabbit-prod-dot"></span>
+      <span id="rabbit-prod-label">Producteurs: —</span>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric-tile">
+        <div class="label">Débit</div>
+        <div class="value" id="rabbit-throughput">—<span class="unit">msg/s</span></div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Latence moy.</div>
+        <div class="value" id="rabbit-latency">—<span class="unit">ms</span></div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Total traités</div>
+        <div class="value" id="rabbit-total">—</div>
+      </div>
+      <div class="metric-tile">
+        <div class="label">Messages perdus</div>
+        <div class="value" id="rabbit-lost">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts-section">
+    <div class="chart-card">
+      <h3>📈 Débit comparé (msg/s)</h3>
+      <canvas id="chart-throughput"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>⏱️ Latence comparée (ms)</h3>
+      <canvas id="chart-latency"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // ── Chart.js setup ──────────────────────────────────────────────────────────
+  const chartDefaults = {
+    responsive: true,
+    maintainAspectRatio: true,
+    animation: { duration: 300 },
+    plugins: { legend: { labels: { color: '#8892a4', font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#8892a4', maxTicksLimit: 8, font: { size: 10 } },
+           grid:  { color: 'rgba(255,255,255,0.05)' } },
+      y: { ticks: { color: '#8892a4', font: { size: 10 } },
+           grid:  { color: 'rgba(255,255,255,0.05)' }, beginAtZero: true },
+    }
+  };
+
+  function makeChart(id, label1, label2, color1, color2) {
+    return new Chart(document.getElementById(id), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: label1, data: [], borderColor: color1, backgroundColor: color1 + '22',
+            borderWidth: 2, pointRadius: 2, tension: 0.3, fill: true },
+          { label: label2, data: [], borderColor: color2, backgroundColor: color2 + '22',
+            borderWidth: 2, pointRadius: 2, tension: 0.3, fill: true },
+        ]
+      },
+      options: chartDefaults,
+    });
+  }
+
+  const chartThroughput = makeChart('chart-throughput',
+    'Kafka/Flink', 'RabbitMQ', '#e74c3c', '#f39c12');
+  const chartLatency = makeChart('chart-latency',
+    'Kafka/Flink', 'RabbitMQ', '#e74c3c', '#f39c12');
+
+  const MAX_POINTS = 60;
+
+  function pushPoint(chart, label, val0, val1) {
+    chart.data.labels.push(label);
+    chart.data.datasets[0].data.push(val0);
+    chart.data.datasets[1].data.push(val1);
+    if (chart.data.labels.length > MAX_POINTS) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+      chart.data.datasets[1].data.shift();
+    }
+    chart.update('none');
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function fmt(val, decimals = 1) {
+    if (val === null || val === undefined) return '—';
+    return Number(val).toFixed(decimals);
+  }
+
+  function setMetric(id, val, decimals = 1) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const unit = el.querySelector('.unit');
+    const unitHtml = unit ? unit.outerHTML : '';
+    el.innerHTML = (val !== null && val !== undefined ? fmt(val, decimals) : '—') + unitHtml;
+  }
+
+  function setProducerStatus(prefix, count) {
+    const dot   = document.getElementById(`${prefix}-prod-dot`);
+    const label = document.getElementById(`${prefix}-prod-label`);
+    const active = count > 0;
+    dot.className   = `prod-indicator ${active ? 'active' : 'inactive'}`;
+    label.textContent = `Producteurs actifs: ${count}`;
+  }
+
+  // ── Fetch & update ───────────────────────────────────────────────────────────
+  async function refresh() {
+    const now = new Date().toLocaleTimeString('fr-FR');
+    document.getElementById('last-update').textContent = `Mis à jour: ${now}`;
+
+    try {
+      // Métriques
+      const mRes  = await fetch('/api/metrics');
+      const mData = await mRes.json();
+
+      const k = mData.kafka    || {};
+      const r = mData.rabbitmq || {};
+
+      setMetric('kafka-throughput', k.throughput_per_sec);
+      setMetric('kafka-latency',    k.avg_latency_ms);
+      setMetric('kafka-total',      k.total_processed, 0);
+      setMetric('kafka-lost',       k.messages_lost,   0);
+      setProducerStatus('kafka', k.active_producers || 0);
+
+      setMetric('rabbit-throughput', r.throughput_per_sec);
+      setMetric('rabbit-latency',    r.avg_latency_ms);
+      setMetric('rabbit-total',      r.total_processed, 0);
+      setMetric('rabbit-lost',       r.messages_lost,   0);
+      setProducerStatus('rabbit', r.active_producers || 0);
+
+      // Graphiques
+      pushPoint(chartThroughput, now,
+        k.throughput_per_sec ?? 0, r.throughput_per_sec ?? 0);
+      pushPoint(chartLatency, now,
+        k.avg_latency_ms ?? 0, r.avg_latency_ms ?? 0);
+
+    } catch (e) {
+      console.error('Erreur métriques:', e);
+    }
+
+    try {
+      // Verdict
+      const vRes  = await fetch('/api/verdict');
+      const vData = await vRes.json();
+      const banner = document.getElementById('verdict-banner');
+
+      if (vData.sufficient_data) {
+        banner.classList.add('visible');
+        document.getElementById('verdict-summary').textContent = vData.summary || '';
+        document.getElementById('kafka-score').textContent  = `Kafka: ${vData.kafka_score}/3`;
+        document.getElementById('rabbit-score').textContent = `RabbitMQ: ${vData.rabbitmq_score}/3`;
+
+        const detailsEl = document.getElementById('verdict-details');
+        detailsEl.innerHTML = '';
+        const metricLabels = {
+          throughput:  '⚡ Débit',
+          latency:     '⏱️ Latence',
+          reliability: '🛡️ Fiabilité',
+        };
+        for (const [key, info] of Object.entries(vData.details || {})) {
+          const winnerClass = info.winner === 'kafka' ? 'winner-kafka' :
+                              info.winner === 'rabbitmq' ? 'winner-rabbit' : '';
+          const winnerText  = info.winner === 'kafka' ? '🔴 Kafka' :
+                              info.winner === 'rabbitmq' ? '🟡 RabbitMQ' : '—';
+          detailsEl.innerHTML += `
+            <div class="verdict-metric">
+              <span class="winner-badge ${winnerClass}">${metricLabels[key] || key}</span>
+              <span class="${winnerClass}">${winnerText}</span>
+              — ${info.label || ''}
+            </div>`;
+        }
+      } else {
+        banner.classList.remove('visible');
+      }
+    } catch (e) {
+      console.error('Erreur verdict:', e);
+    }
+  }
+
+  // Démarrage
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

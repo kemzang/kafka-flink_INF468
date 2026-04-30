@@ -1,9 +1,17 @@
 version: '3.8'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BENCHMARK : Kafka/Flink vs RabbitMQ — Architecture distribuée
+#
+# Avant de démarrer, créez un fichier .env à la racine avec :
+#   CENTRAL_IP=<votre IP locale>   ex: 192.168.1.50
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
-  # ─────────────────────────────────────────────────────────────
-  # KAFKA (mode KRaft — sans Zookeeper, version moderne)
-  # ─────────────────────────────────────────────────────────────
+
+  # ───────────────────────────────────────────────────────────────
+  # KAFKA (mode KRaft — sans Zookeeper)
+  # ───────────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     hostname: kafka
@@ -14,7 +22,8 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      # PLAINTEXT_HOST utilise CENTRAL_IP pour être accessible depuis les PCs distants
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${CENTRAL_IP:-localhost}:9092'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -37,9 +46,30 @@ services:
       timeout: 10s
       retries: 10
 
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # RABBITMQ (broker de messages avec interface de gestion)
+  # ───────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP — accès depuis les PCs distants
+      - "15672:15672"  # Interface web de gestion RabbitMQ
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: password123
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ───────────────────────────────────────────────────────────────
   # MONGODB (base NoSQL document store)
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
   mongodb:
     image: mongo:7.0
     container_name: mongodb
@@ -54,9 +84,9 @@ services:
     networks:
       - bigdata_net
 
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
   # MONGO EXPRESS (interface web pour MongoDB)
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
   mongo-express:
     image: mongo-express:1.0.2
     container_name: mongo-express
@@ -72,13 +102,11 @@ services:
     networks:
       - bigdata_net
 
-  # ─────────────────────────────────────────────────────────────
-  # FLINK JOBMANAGER (coordinateur)
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # FLINK JOBMANAGER — utilise l'image locale flink:latest
+  # ───────────────────────────────────────────────────────────────
   flink-jobmanager:
-    build:
-      context: ./flink_job
-      dockerfile: Dockerfile
+    image: flink:latest
     container_name: flink-jobmanager
     ports:
       - "8082:8081"
@@ -94,13 +122,11 @@ services:
       kafka:
         condition: service_healthy
 
-  # ─────────────────────────────────────────────────────────────
-  # FLINK TASKMANAGER (exécuteur de tâches)
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # FLINK TASKMANAGER — utilise l'image locale flink:latest
+  # ───────────────────────────────────────────────────────────────
   flink-taskmanager:
-    build:
-      context: ./flink_job
-      dockerfile: Dockerfile
+    image: flink:latest
     container_name: flink-taskmanager
     command: taskmanager
     environment:
@@ -113,32 +139,16 @@ services:
     depends_on:
       - flink-jobmanager
 
-  # ─────────────────────────────────────────────────────────────
-  # PRODUCTEUR KAFKA (génère les événements de ventes)
-  # ─────────────────────────────────────────────────────────────
-  producer:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile
-    container_name: kafka-producer
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      TOPIC_NAME: sales_events
-    depends_on:
-      kafka:
-        condition: service_healthy
-    networks:
-      - bigdata_net
-
-# ─────────────────────────────────────────────────────────────
-  # JOB FLINK (traitement Kafka → MongoDB)
-  # ─────────────────────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────
+  # FLINK JOB — utilise l'image producer déjà construite
+  # (contient kafka-python + pymongo)
+  # ───────────────────────────────────────────────────────────────
   flink-job:
-    build:
-      context: ./flink_job
-      dockerfile: Dockerfile
+    image: tp_big_data_kafka_flink-producer:latest
     container_name: flink-job
-    command: python3 /opt/flink/flink_job.py
+    command: python3 /app/flink_job.py
+    volumes:
+      - ./flink_job/flink_job.py:/app/flink_job.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       MONGO_URI: mongodb://admin:password123@mongodb:27017/
@@ -150,6 +160,60 @@ services:
     networks:
       - bigdata_net
     restart: on-failure
+
+  # ───────────────────────────────────────────────────────────────
+  # RABBITMQ WORKER — utilise l'image déjà construite
+  # ───────────────────────────────────────────────────────────────
+  rabbitmq-worker:
+    image: tp_big_data_kafka_flink-rabbitmq-worker:latest
+    container_name: rabbitmq-worker
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: password123
+      MONGO_URI: mongodb://admin:password123@mongodb:27017/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongodb:
+        condition: service_started
+    networks:
+      - bigdata_net
+    restart: on-failure
+
+  # ───────────────────────────────────────────────────────────────
+  # DASHBOARD WEB — utilise l'image déjà construite
+  # Accessible sur http://<CENTRAL_IP>:5000
+  # ───────────────────────────────────────────────────────────────
+  dashboard:
+    image: tp_big_data_kafka_flink-dashboard:latest
+    container_name: dashboard
+    ports:
+      - "5000:5000"
+    environment:
+      MONGO_URI: mongodb://admin:password123@mongodb:27017/
+      FLASK_ENV: production
+    depends_on:
+      - mongodb
+    networks:
+      - bigdata_net
+    restart: on-failure
+
+  # ───────────────────────────────────────────────────────────────
+  # PRODUCTEUR KAFKA LOCAL — utilise l'image déjà construite
+  # ───────────────────────────────────────────────────────────────
+  producer:
+    image: tp_big_data_kafka_flink-producer:latest
+    container_name: kafka-producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: sales_events
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - bigdata_net
 
 volumes:
   mongodb_data:

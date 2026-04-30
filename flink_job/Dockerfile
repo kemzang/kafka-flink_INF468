@@ -1,17 +1,13 @@
 FROM flink:1.18-scala_2.12-java11
 
-RUN apt-get update && \
-    apt-get install -y python3 python3-pip wget && \
-    rm -rf /var/lib/apt/lists/*
+# Python est déjà présent dans l'image Flink de base
+# On installe uniquement les packages Python nécessaires
+RUN pip3 install --no-cache-dir \
+    pymongo==4.7.2 \
+    kafka-python==2.0.2
 
-RUN pip3 install --no-cache-dir pymongo==4.6.1 kafka-python==2.0.2
+# Connecteur Kafka pour Flink (déjà téléchargé dans le cache Docker si disponible)
+# Si pas de connexion, ces JARs doivent être présents localement
+COPY flink_job.py /opt/flink/usrlib/flink_job.py
 
-RUN wget -q -P /opt/flink/lib \
-    https://repo.maven.apache.org/maven2/org/apache/flink/flink-connector-kafka/3.1.0-1.18/flink-connector-kafka-3.1.0-1.18.jar
-
-RUN wget -q -P /opt/flink/lib \
-    https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar
-
-COPY flink_job.py /opt/flink/flink_job.py
-
-ENV PYTHONPATH="/opt/flink"
+ENV PYTHONPATH="/opt/flink/usrlib"
