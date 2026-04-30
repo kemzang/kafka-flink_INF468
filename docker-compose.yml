@@ -1,0 +1,159 @@
+version: '3.8'
+
+services:
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA (mode KRaft — sans Zookeeper, version moderne)
+  # ─────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─────────────────────────────────────────────────────────────
+  # MONGODB (base NoSQL document store)
+  # ─────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+      MONGO_INITDB_DATABASE: sales_db
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - bigdata_net
+
+  # ─────────────────────────────────────────────────────────────
+  # MONGO EXPRESS (interface web pour MongoDB)
+  # ─────────────────────────────────────────────────────────────
+  mongo-express:
+    image: mongo-express:1.0.2
+    container_name: mongo-express
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: password123
+      ME_CONFIG_MONGODB_URL: mongodb://admin:password123@mongodb:27017/
+      ME_CONFIG_BASICAUTH: false
+    depends_on:
+      - mongodb
+    networks:
+      - bigdata_net
+
+  # ─────────────────────────────────────────────────────────────
+  # FLINK JOBMANAGER (coordinateur)
+  # ─────────────────────────────────────────────────────────────
+  flink-jobmanager:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    container_name: flink-jobmanager
+    ports:
+      - "8082:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        parallelism.default: 2
+    networks:
+      - bigdata_net
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────────────────
+  # FLINK TASKMANAGER (exécuteur de tâches)
+  # ─────────────────────────────────────────────────────────────
+  flink-taskmanager:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    container_name: flink-taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+    networks:
+      - bigdata_net
+    depends_on:
+      - flink-jobmanager
+
+  # ─────────────────────────────────────────────────────────────
+  # PRODUCTEUR KAFKA (génère les événements de ventes)
+  # ─────────────────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: kafka-producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: sales_events
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - bigdata_net
+
+# ─────────────────────────────────────────────────────────────
+  # JOB FLINK (traitement Kafka → MongoDB)
+  # ─────────────────────────────────────────────────────────────
+  flink-job:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    container_name: flink-job
+    command: python3 /opt/flink/flink_job.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_URI: mongodb://admin:password123@mongodb:27017/
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongodb:
+        condition: service_started
+    networks:
+      - bigdata_net
+    restart: on-failure
+
+volumes:
+  mongodb_data:
+
+networks:
+  bigdata_net:
+    driver: bridge
