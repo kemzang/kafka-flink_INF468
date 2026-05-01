@@ -170,7 +170,9 @@ services:
   # RABBITMQ WORKER — utilise l'image déjà construite
   # ───────────────────────────────────────────────────────────────
   rabbitmq-worker:
-    image: tp_big_data_kafka_flink-rabbitmq-worker:latest
+    build:
+      context: ./rabbitmq_worker
+      dockerfile: Dockerfile
     container_name: rabbitmq-worker
     environment:
       RABBITMQ_HOST: rabbitmq
@@ -192,7 +194,9 @@ services:
   # Accessible sur http://<CENTRAL_IP>:5000
   # ───────────────────────────────────────────────────────────────
   dashboard:
-    image: tp_big_data_kafka_flink-dashboard:latest
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
     container_name: dashboard
     ports:
       - "5000:5000"
@@ -209,7 +213,9 @@ services:
   # PRODUCTEUR KAFKA LOCAL — utilise l'image déjà construite
   # ───────────────────────────────────────────────────────────────
   producer:
-    image: tp_big_data_kafka_flink-producer:latest
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
     container_name: kafka-producer
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
