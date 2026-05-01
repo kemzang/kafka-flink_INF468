@@ -112,9 +112,14 @@ def enrich_event(event):
 # ─── Calcul de la latence ─────────────────────────────────────────────────────
 def compute_latency(sent_at_str):
     try:
-        sent_at = datetime.fromisoformat(sent_at_str.rstrip("Z")).replace(tzinfo=timezone.utc)
+        if not sent_at_str:
+            return None
+        normalized = sent_at_str.replace("+00:00", "").replace("Z", "").strip()
+        sent_at = datetime.fromisoformat(normalized).replace(tzinfo=timezone.utc)
         now     = datetime.now(timezone.utc)
-        return max(0.0, (now - sent_at).total_seconds() * 1000)
+        ms = (now - sent_at).total_seconds() * 1000
+        # Ignorer les valeurs négatives ou irréalistes (horloge désynchronisée)
+        return round(ms, 2) if ms > 0.1 else None
     except Exception:
         return None
 
@@ -220,6 +225,35 @@ def connect_rabbitmq():
     raise RuntimeError(f"[WORKER] ❌ Impossible de se connecter à RabbitMQ après {len(delays)} tentatives.")
 
 
+# ─── Thread dédié aux heartbeats ─────────────────────────────────────────────
+# Connexion séparée pour ne pas être bloqué par la queue sales_events
+def heartbeat_consumer_thread():
+    """Consomme la queue producer_heartbeats sur une connexion dédiée."""
+    time.sleep(12)  # laisser le worker principal démarrer d'abord
+    while True:
+        try:
+            credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+            params = pika.ConnectionParameters(
+                host=RABBITMQ_HOST,
+                port=RABBITMQ_PORT,
+                credentials=credentials,
+                heartbeat=600,
+                blocked_connection_timeout=300,
+            )
+            conn    = pika.BlockingConnection(params)
+            channel = conn.channel()
+            channel.queue_declare(queue="producer_heartbeats", durable=True)
+            channel.basic_consume(
+                queue="producer_heartbeats",
+                on_message_callback=on_heartbeat,
+            )
+            print("[WORKER] ✅ Heartbeat consumer démarré (connexion dédiée)")
+            channel.start_consuming()
+        except Exception as e:
+            print(f"[WORKER] ❌ Heartbeat consumer: {e}. Retry 5s...")
+            time.sleep(5)
+
+
 # ─── Pipeline principal ───────────────────────────────────────────────────────
 def main():
     print("=" * 60)
@@ -237,27 +271,26 @@ def main():
     t = threading.Thread(target=metrics_writer, args=(db,), daemon=True)
     t.start()
 
+    # Démarrer le thread heartbeat sur une connexion dédiée
+    t_hb = threading.Thread(target=heartbeat_consumer_thread, daemon=True)
+    t_hb.start()
+
     while True:
         try:
             connection = connect_rabbitmq()
             channel    = connection.channel()
 
             # Déclarer les queues durables
-            channel.queue_declare(queue="sales_events",       durable=True)
+            channel.queue_declare(queue="sales_events",        durable=True)
             channel.queue_declare(queue="producer_heartbeats", durable=True)
 
             # Limiter la charge simultanée
             channel.basic_qos(prefetch_count=10)
 
-            # Consommer les ventes
+            # Consommer uniquement les ventes (heartbeats sur thread séparé)
             channel.basic_consume(
                 queue="sales_events",
                 on_message_callback=lambda ch, m, p, b: on_sales_message(ch, m, p, b, db),
-            )
-            # Consommer les heartbeats
-            channel.basic_consume(
-                queue="producer_heartbeats",
-                on_message_callback=on_heartbeat,
             )
 
             print("[WORKER] 🚀 En attente de messages...")

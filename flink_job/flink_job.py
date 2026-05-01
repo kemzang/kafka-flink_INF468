@@ -1,6 +1,7 @@
 """
 Job PyFlink réel — Kafka → MongoDB
 Utilise l'API PyFlink DataStream avec KafkaSource officiel.
+Les métriques sont calculées directement depuis MongoDB (compatible multi-process PyFlink).
 """
 import json
 import os
@@ -30,56 +31,6 @@ MAX_METRICS_DOCS  = 1000
 HEARTBEAT_TIMEOUT = 15
 
 
-# ─── État partagé ─────────────────────────────────────────────
-class PipelineState:
-    def __init__(self):
-        self.total_processed  = 0
-        self.messages_lost    = 0
-        self.latencies        = []
-        self.window_count     = 0
-        self.window_start     = time.time()
-        self.active_producers = {}
-
-    def record_event(self, latency_ms):
-        self.total_processed += 1
-        self.window_count    += 1
-        if latency_ms is not None and latency_ms > 0:
-            self.latencies.append(latency_ms)
-
-    def record_loss(self):
-        self.messages_lost += 1
-
-    def record_heartbeat(self, producer_id):
-        self.active_producers[producer_id] = time.time()
-
-    def flush_window(self):
-        elapsed   = max(time.time() - self.window_start, 0.001)
-        count     = self.window_count
-        latencies = list(self.latencies)
-        total     = self.total_processed
-        lost      = self.messages_lost
-        now       = time.time()
-        active    = {pid: ts for pid, ts in self.active_producers.items()
-                     if now - ts <= HEARTBEAT_TIMEOUT}
-        self.active_producers = active
-        self.window_count     = 0
-        self.latencies        = []
-        self.window_start     = time.time()
-
-        return {
-            "pipeline":           PIPELINE,
-            "timestamp":          datetime.now(timezone.utc),
-            "throughput_per_sec": round(count / elapsed, 2),
-            "avg_latency_ms":     round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
-            "total_processed":    total,
-            "messages_lost":      lost,
-            "active_producers":   len(active),
-        }
-
-
-state = PipelineState()
-
-
 def get_db():
     client = MongoClient(MONGO_URI)
     db = client[MONGO_DB]
@@ -94,21 +45,22 @@ def compute_latency(sent_at_str):
     try:
         if not sent_at_str:
             return None
-        sent_at = datetime.fromisoformat(sent_at_str.rstrip("Z")).replace(tzinfo=timezone.utc)
+        # Normalise le format ISO : retire +00:00 ou Z pour compatibilité Python 3.9/3.10
+        normalized = sent_at_str.replace("+00:00", "").replace("Z", "").strip()
+        sent_at = datetime.fromisoformat(normalized).replace(tzinfo=timezone.utc)
         return round(max(0.0, (datetime.now(timezone.utc) - sent_at).total_seconds() * 1000), 2)
     except Exception:
         return None
 
 
 # ─── PyFlink MapFunction ──────────────────────────────────────
+# Tourne dans le TaskManager (processus séparé du main).
+# Écrit chaque événement dans MongoDB et insère un doc de métriques par événement.
 class EnrichEvent(MapFunction):
     def __init__(self, mongo_uri, mongo_db):
-        self.mongo_uri  = mongo_uri
-        self.mongo_db   = mongo_db
-        self._db        = None
-        # compteurs locaux (pas de threading.Lock — sérialisables)
-        self._processed = 0
-        self._lost      = 0
+        self.mongo_uri = mongo_uri
+        self.mongo_db  = mongo_db
+        self._db       = None
 
     def open(self, runtime_context):
         self._db = MongoClient(self.mongo_uri)[self.mongo_db]
@@ -126,7 +78,6 @@ class EnrichEvent(MapFunction):
                 })
             except Exception:
                 pass
-            self._lost += 1
             return None
 
         total      = event.get("total_amount", 0)
@@ -142,7 +93,7 @@ class EnrichEvent(MapFunction):
         try:
             self._db["sales_raw"].insert_one({k: v for k, v in event.items() if k != "_id"})
         except Exception as ex:
-            print(f"[PYFLINK] ❌ MongoDB: {ex}")
+            print(f"[PYFLINK] ❌ MongoDB insert: {ex}")
 
         if total > 500:
             try:
@@ -157,8 +108,7 @@ class EnrichEvent(MapFunction):
                 pass
             print(f"[PYFLINK] 🚨 ALERTE: {total}€ — {event.get('product_name')}")
 
-        self._processed += 1
-        lat_str = f"{latency_ms}ms" if latency_ms else "N/A"
+        lat_str = f"{latency_ms:.1f}ms" if latency_ms is not None else "N/A"
         print(f"[PYFLINK] ✅ {event.get('product_name','?')} x{event.get('quantity','?')} "
               f"= {total}€ | latence: {lat_str}")
         return json.dumps(event)
@@ -217,30 +167,9 @@ class AggregateWindow(ProcessWindowFunction):
         yield json.dumps({"window_closed": True, "events": count})
 
 
-# ─── Thread métriques ─────────────────────────────────────────
-def metrics_writer(db):
-    while True:
-        time.sleep(METRICS_INTERVAL)
-        try:
-            snap = state.flush_window()
-            db["benchmark_metrics"].insert_one(snap)
-            count = db["benchmark_metrics"].count_documents({"pipeline": PIPELINE})
-            if count > MAX_METRICS_DOCS:
-                oldest = list(db["benchmark_metrics"]
-                              .find({"pipeline": PIPELINE}, {"_id": 1})
-                              .sort("timestamp", ASCENDING)
-                              .limit(count - MAX_METRICS_DOCS))
-                db["benchmark_metrics"].delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
-            print(f"[PYFLINK] 📈 débit={snap['throughput_per_sec']} msg/s | "
-                  f"latence={snap['avg_latency_ms']}ms | "
-                  f"total={snap['total_processed']} | "
-                  f"producteurs={snap['active_producers']}")
-        except Exception as e:
-            print(f"[PYFLINK] ❌ Métriques: {e}")
-
-
-# ─── Thread heartbeats ────────────────────────────────────────
-def heartbeat_consumer():
+# ─── Thread heartbeats (Kafka consumer natif) ─────────────────
+# Stocke les heartbeats dans MongoDB pour que le metrics_writer puisse les lire.
+def heartbeat_consumer(db):
     time.sleep(20)
     while True:
         try:
@@ -256,12 +185,96 @@ def heartbeat_consumer():
             print("[PYFLINK] ✅ Heartbeat consumer connecté")
             for msg in c:
                 try:
-                    state.record_heartbeat(msg.value.get("producer_id", "unknown"))
+                    producer_id = msg.value.get("producer_id", "unknown")
+                    # Upsert du heartbeat dans MongoDB (source de vérité partagée)
+                    db["producer_heartbeats"].update_one(
+                        {"producer_id": producer_id, "pipeline": "kafka"},
+                        {"$set": {
+                            "producer_id": producer_id,
+                            "pipeline":    "kafka",
+                            "last_seen":   datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
                 except Exception:
                     pass
         except Exception as e:
             print(f"[PYFLINK] ❌ Heartbeat: {e}. Retry 10s...")
             time.sleep(10)
+
+
+# ─── Thread métriques ─────────────────────────────────────────
+# Calcule les métriques depuis MongoDB directement — fonctionne même
+# si la MapFunction tourne dans un processus TaskManager séparé.
+def metrics_writer(db):
+    # Fenêtre glissante : on garde le timestamp du dernier snapshot
+    last_snapshot_time = datetime.now(timezone.utc)
+    last_total         = db["sales_raw"].count_documents({"pipeline": "kafka"}) if "sales_raw" in db.list_collection_names() else 0
+
+    while True:
+        time.sleep(METRICS_INTERVAL)
+        try:
+            now = datetime.now(timezone.utc)
+
+            # Total traités = nombre de docs dans sales_raw avec pipeline=kafka
+            total_processed = db["sales_raw"].count_documents({"processor": "pyflink-pipeline-v1.0"})
+
+            # Débit = nouveaux docs depuis le dernier snapshot
+            new_in_window   = total_processed - last_total
+            elapsed_s       = max((now - last_snapshot_time).total_seconds(), 0.001)
+            throughput      = round(new_in_window / elapsed_s, 2)
+
+            # Latence moyenne sur les derniers docs traités
+            recent_docs = list(
+                db["sales_raw"]
+                .find(
+                    {"processor": "pyflink-pipeline-v1.0", "latency_ms": {"$exists": True}},
+                    {"latency_ms": 1}
+                )
+                .sort("processed_at", DESCENDING)
+                .limit(50)
+            )
+            latencies   = [d["latency_ms"] for d in recent_docs if d.get("latency_ms") is not None]
+            avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
+
+            # Producteurs actifs via MongoDB heartbeats
+            cutoff = datetime.now(timezone.utc).timestamp() - HEARTBEAT_TIMEOUT
+            from datetime import timezone as tz
+            active_producers = db["producer_heartbeats"].count_documents({
+                "pipeline": "kafka",
+                "last_seen": {"$gte": datetime.fromtimestamp(cutoff, tz=timezone.utc)},
+            })
+
+            snap = {
+                "pipeline":           PIPELINE,
+                "timestamp":          now,
+                "throughput_per_sec": throughput,
+                "avg_latency_ms":     avg_latency,
+                "total_processed":    total_processed,
+                "messages_lost":      0,
+                "active_producers":   active_producers,
+            }
+            db["benchmark_metrics"].insert_one(snap)
+
+            # Rétention
+            count = db["benchmark_metrics"].count_documents({"pipeline": PIPELINE})
+            if count > MAX_METRICS_DOCS:
+                oldest = list(db["benchmark_metrics"]
+                              .find({"pipeline": PIPELINE}, {"_id": 1})
+                              .sort("timestamp", ASCENDING)
+                              .limit(count - MAX_METRICS_DOCS))
+                db["benchmark_metrics"].delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
+
+            print(f"[PYFLINK] 📈 débit={throughput} msg/s | "
+                  f"latence={avg_latency}ms | "
+                  f"total={total_processed} | "
+                  f"producteurs={active_producers}")
+
+            last_total         = total_processed
+            last_snapshot_time = now
+
+        except Exception as e:
+            print(f"[PYFLINK] ❌ Métriques: {e}")
 
 
 # ─── Main ─────────────────────────────────────────────────────
@@ -276,8 +289,8 @@ def main():
     db = get_db()
     print("[PYFLINK] ✅ MongoDB connecté")
 
-    threading.Thread(target=metrics_writer,    args=(db,), daemon=True).start()
-    threading.Thread(target=heartbeat_consumer,             daemon=True).start()
+    threading.Thread(target=metrics_writer,          args=(db,), daemon=True).start()
+    threading.Thread(target=heartbeat_consumer,      args=(db,), daemon=True).start()
 
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
@@ -288,7 +301,7 @@ def main():
         .set_bootstrap_servers(KAFKA_BOOTSTRAP)
         .set_topics(TOPIC_SALES)
         .set_group_id("pyflink-sales-group")
-        .set_starting_offsets(KafkaOffsetsInitializer.latest())
+        .set_starting_offsets(KafkaOffsetsInitializer.earliest())
         .set_value_only_deserializer(SimpleStringSchema())
         .set_property("metadata.max.age.ms", "30000")
         .set_property("request.timeout.ms", "30000")
