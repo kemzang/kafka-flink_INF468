@@ -9,10 +9,21 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # ── PyFlink + dépendances Python ──────────────────────────────
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip3 install --no-cache-dir --timeout 300 \
-        "ruamel.yaml==0.18.6" \
-        "ruamel.yaml.clib==0.2.8" \
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DEFAULT_TIMEOUT=1000
+ENV PIP_RETRIES=20
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_REQUIRE_HASH=false
+RUN pip3 install --no-cache-dir setuptools wheel && \
+    pip3 install --no-cache-dir --timeout 1000 --retries 20 \
+        --trusted-host files.pythonhosted.org \
+        --trusted-host pypi.org \
+        pyarrow==11.0.0 && \
+    pip3 install --no-cache-dir --timeout 1000 --retries 20 \
+        --trusted-host files.pythonhosted.org \
+        --trusted-host pypi.org \
+        ruamel.yaml==0.18.6 \
+        ruamel.yaml.clib==0.2.8 \
         apache-flink==1.19.0 \
         pymongo==4.7.2 \
         kafka-python==2.0.2
