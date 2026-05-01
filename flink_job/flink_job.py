@@ -301,7 +301,7 @@ def main():
         .set_bootstrap_servers(KAFKA_BOOTSTRAP)
         .set_topics(TOPIC_SALES)
         .set_group_id("pyflink-sales-group")
-        .set_starting_offsets(KafkaOffsetsInitializer.earliest())
+        .set_starting_offsets(KafkaOffsetsInitializer.latest())
         .set_value_only_deserializer(SimpleStringSchema())
         .set_property("metadata.max.age.ms", "30000")
         .set_property("request.timeout.ms", "30000")

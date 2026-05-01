@@ -210,7 +210,7 @@ services:
     restart: on-failure
 
   # ───────────────────────────────────────────────────────────────
-  # PRODUCTEUR KAFKA LOCAL — utilise l'image déjà construite
+  # PRODUCTEUR KAFKA LOCAL — désactivé (utiliser producer_kafka/ à la place)
   # ───────────────────────────────────────────────────────────────
   producer:
     build:
@@ -225,6 +225,8 @@ services:
         condition: service_healthy
     networks:
       - bigdata_net
+    profiles:
+      - disabled
 
 volumes:
   mongodb_data:
