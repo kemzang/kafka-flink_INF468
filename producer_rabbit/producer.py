@@ -1,7 +1,8 @@
 """
 Producteur RabbitMQ distant — Benchmark Kafka vs RabbitMQ
-À exécuter sur les PCs distants (PC3, PC4)
-Configuration via fichier .env (pas d'IP codée en dur)
+Mode normal  : 1 message toutes les SEND_INTERVAL_MS (défaut 500ms)
+Mode turbo   : TURBO_MODE=true → plusieurs threads, débit maximal
+Configuration via fichier .env
 """
 import json
 import os
@@ -19,9 +20,8 @@ from faker import Faker
 import pika
 from pika.exceptions import AMQPConnectionError
 
-# ─── Chargement de la configuration ──────────────────────────────────────────
+# ─── Chargement de la configuration ──────────────────────────
 ENV_PATH = Path(__file__).parent / ".env"
-
 if not ENV_PATH.exists():
     print(f"[ERREUR] Fichier .env introuvable : {ENV_PATH}")
     print("[AIDE]  Copiez .env.example en .env et renseignez CENTRAL_IP")
@@ -34,6 +34,8 @@ RABBITMQ_PORT    = int(os.getenv("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER    = os.getenv("RABBITMQ_USER", "admin")
 RABBITMQ_PASS    = os.getenv("RABBITMQ_PASS", "password123")
 SEND_INTERVAL_MS = int(os.getenv("SEND_INTERVAL_MS", "500"))
+TURBO_MODE       = os.getenv("TURBO_MODE", "false").lower() == "true"
+TURBO_THREADS    = int(os.getenv("TURBO_THREADS", "4"))
 
 if not CENTRAL_IP:
     print("[ERREUR] Variable CENTRAL_IP manquante dans le fichier .env")
@@ -41,8 +43,7 @@ if not CENTRAL_IP:
 
 QUEUE_SALES     = "sales_events"
 QUEUE_HEARTBEAT = "producer_heartbeats"
-
-PRODUCER_ID = f"rabbit-{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
+PRODUCER_ID     = f"rabbit-{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
 
 fake = Faker("fr_FR")
 
@@ -86,18 +87,20 @@ def create_event():
     }
 
 
-def connect_rabbitmq(max_retries=3):
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    params = pika.ConnectionParameters(
+def make_pika_params():
+    return pika.ConnectionParameters(
         host=CENTRAL_IP,
         port=RABBITMQ_PORT,
-        credentials=credentials,
+        credentials=pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS),
         heartbeat=600,
         blocked_connection_timeout=300,
     )
+
+
+def connect_rabbitmq(max_retries=3):
     for attempt in range(1, max_retries + 1):
         try:
-            conn    = pika.BlockingConnection(params)
+            conn    = pika.BlockingConnection(make_pika_params())
             channel = conn.channel()
             channel.queue_declare(queue=QUEUE_SALES,     durable=True)
             channel.queue_declare(queue=QUEUE_HEARTBEAT, durable=True)
@@ -110,7 +113,6 @@ def connect_rabbitmq(max_retries=3):
                 time.sleep(10)
     print(f"[ERREUR] Connexion échouée après {max_retries} tentatives.")
     print(f"[AIDE]  Vérifiez que CENTRAL_IP={CENTRAL_IP} est correct dans .env")
-    print(f"[AIDE]  Vérifiez que le PC central est démarré et accessible sur le réseau")
     sys.exit(1)
 
 
@@ -135,11 +137,106 @@ def heartbeat_sender(channel):
         time.sleep(5)
 
 
-def main():
+# ─── Compteur partagé pour le mode turbo ─────────────────────
+class TurboCounter:
+    def __init__(self):
+        self._lock  = threading.Lock()
+        self._count = 0
+
+    def add(self, n=1):
+        with self._lock:
+            self._count += n
+
+    @property
+    def count(self):
+        with self._lock:
+            return self._count
+
+
+def turbo_worker(thread_id, counter):
+    """
+    Thread turbo RabbitMQ — chaque thread a sa propre connexion
+    (RabbitMQ BlockingConnection n'est pas thread-safe).
+    Envoie en mode non-persistant (delivery_mode=1) pour maximiser le débit.
+    """
+    try:
+        conn    = pika.BlockingConnection(make_pika_params())
+        channel = conn.channel()
+        channel.queue_declare(queue=QUEUE_SALES, durable=True)
+        print(f"[RABBIT-TURBO-{thread_id}] ✅ Connecté — envoi en cours...")
+    except Exception as e:
+        print(f"[RABBIT-TURBO-{thread_id}] ❌ Connexion échouée: {e}")
+        return
+
+    while True:
+        try:
+            event = create_event()
+            channel.basic_publish(
+                exchange="",
+                routing_key=QUEUE_SALES,
+                body=json.dumps(event).encode("utf-8"),
+                # delivery_mode=1 = non-persistant (pas de fsync disque = plus rapide)
+                properties=pika.BasicProperties(delivery_mode=1),
+            )
+            counter.add(1)
+        except (AMQPConnectionError, Exception) as e:
+            print(f"[RABBIT-TURBO-{thread_id}] ❌ Connexion perdue: {e}. Reconnexion...")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            time.sleep(3)
+            try:
+                conn    = pika.BlockingConnection(make_pika_params())
+                channel = conn.channel()
+                channel.queue_declare(queue=QUEUE_SALES, durable=True)
+            except Exception as e2:
+                print(f"[RABBIT-TURBO-{thread_id}] ❌ Reconnexion échouée: {e2}")
+                time.sleep(5)
+
+
+def main_turbo():
+    """Mode turbo — plusieurs threads, débit maximal."""
+    print("=" * 60)
+    print(f"[RABBIT-TURBO] 🚀 Mode TURBO activé")
+    print(f"[RABBIT-TURBO] Producer ID : {PRODUCER_ID}")
+    print(f"[RABBIT-TURBO] PC Central  : {CENTRAL_IP}:{RABBITMQ_PORT}")
+    print(f"[RABBIT-TURBO] Threads     : {TURBO_THREADS}")
+    print(f"[RABBIT-TURBO] Mode        : non-persistant (delivery_mode=1)")
+    print("=" * 60)
+
+    counter = TurboCounter()
+
+    # Thread heartbeat
+    _, hb_channel = connect_rabbitmq()
+    t_hb = threading.Thread(target=heartbeat_sender, args=(hb_channel,), daemon=True)
+    t_hb.start()
+
+    # Threads turbo
+    for i in range(TURBO_THREADS):
+        t = threading.Thread(target=turbo_worker, args=(i+1, counter), daemon=True)
+        t.start()
+
+    # Reporter toutes les 5s
+    prev       = 0
+    prev_time  = time.time()
+    start_time = time.time()
+    while True:
+        time.sleep(5)
+        now     = time.time()
+        total   = counter.count
+        rate    = (total - prev) / max(now - prev_time, 0.001)
+        elapsed = now - start_time
+        print(f"[RABBIT-TURBO] ⚡ {total:>10,} msgs total | {rate:>8,.0f} msg/s | {elapsed:.0f}s écoulées")
+        prev      = total
+        prev_time = now
+
+
+def main_normal():
+    """Mode normal — 1 message toutes les SEND_INTERVAL_MS."""
     print("=" * 60)
     print(f"[RABBIT-PRODUCER] Démarrage")
     print(f"[RABBIT-PRODUCER] Producer ID : {PRODUCER_ID}")
-    print(f"[RABBIT-PRODUCER] Pipeline    : rabbitmq")
     print(f"[RABBIT-PRODUCER] PC Central  : {CENTRAL_IP}:{RABBITMQ_PORT}")
     print(f"[RABBIT-PRODUCER] Intervalle  : {SEND_INTERVAL_MS}ms")
     print("=" * 60)
@@ -147,7 +244,6 @@ def main():
     connection, channel = connect_rabbitmq()
     print(f"[RABBIT-PRODUCER] ✅ Connecté à RabbitMQ sur {CENTRAL_IP}:{RABBITMQ_PORT}")
 
-    # Thread heartbeat
     t = threading.Thread(target=heartbeat_sender, args=(channel,), daemon=True)
     t.start()
 
@@ -159,7 +255,7 @@ def main():
                 exchange="",
                 routing_key=QUEUE_SALES,
                 body=json.dumps(event).encode("utf-8"),
-                properties=pika.BasicProperties(delivery_mode=2),  # message persistant
+                properties=pika.BasicProperties(delivery_mode=2),
             )
             count += 1
             print(f"[RABBIT-PRODUCER] #{count} | {event['product_name']} x{event['quantity']} "
@@ -178,4 +274,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if TURBO_MODE:
+        main_turbo()
+    else:
+        main_normal()

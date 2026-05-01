@@ -112,9 +112,12 @@ def enrich_event(event):
 # ─── Calcul de la latence ─────────────────────────────────────────────────────
 def compute_latency(sent_at_str):
     try:
-        sent_at = datetime.fromisoformat(sent_at_str.rstrip("Z")).replace(tzinfo=timezone.utc)
+        if not sent_at_str:
+            return None
+        normalized = sent_at_str.replace("+00:00", "").replace("Z", "").strip()
+        sent_at = datetime.fromisoformat(normalized).replace(tzinfo=timezone.utc)
         now     = datetime.now(timezone.utc)
-        return max(0.0, (now - sent_at).total_seconds() * 1000)
+        return round(max(0.0, (now - sent_at).total_seconds() * 1000), 2)
     except Exception:
         return None
 
