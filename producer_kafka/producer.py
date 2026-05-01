@@ -98,7 +98,7 @@ def connect_kafka(turbo=False, max_retries=3):
                     # ── Optimisations débit maximal ──
                     batch_size=65536,        # 64KB par batch
                     linger_ms=5,             # attend 5ms pour remplir le batch
-                    compression_type="lz4",  # compression rapide
+                    compression_type="gzip", # compression native Python (pas de dépendance externe)
                     acks=1,                  # leader ack seulement
                     buffer_memory=67108864,  # 64MB buffer
                     retries=3,

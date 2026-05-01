@@ -204,27 +204,49 @@ def heartbeat_consumer(db):
 
 
 # ─── Thread métriques ─────────────────────────────────────────
-# Calcule les métriques depuis MongoDB directement — fonctionne même
-# si la MapFunction tourne dans un processus TaskManager séparé.
+# Mesure le débit réel d'ingestion Kafka via les offsets du topic,
+# pas ce que Flink traite — pour une comparaison équitable avec RabbitMQ.
 def metrics_writer(db):
-    # Fenêtre glissante : on garde le timestamp du dernier snapshot
+    from kafka import KafkaConsumer, TopicPartition
+    from kafka.admin import KafkaAdminClient
+
     last_snapshot_time = datetime.now(timezone.utc)
-    last_total         = db["sales_raw"].count_documents({"pipeline": "kafka"}) if "sales_raw" in db.list_collection_names() else 0
+    last_offset_total  = 0
+
+    def get_kafka_end_offsets():
+        """Retourne le total des offsets de fin sur toutes les partitions du topic."""
+        try:
+            consumer = KafkaConsumer(
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id=None,
+                consumer_timeout_ms=3000,
+            )
+            partitions = consumer.partitions_for_topic(TOPIC_SALES)
+            if not partitions:
+                consumer.close()
+                return 0
+            tps = [TopicPartition(TOPIC_SALES, p) for p in partitions]
+            end_offsets = consumer.end_offsets(tps)
+            consumer.close()
+            return sum(end_offsets.values())
+        except Exception:
+            return 0
 
     while True:
         time.sleep(METRICS_INTERVAL)
         try:
             now = datetime.now(timezone.utc)
 
-            # Total traités = nombre de docs dans sales_raw avec pipeline=kafka
-            total_processed = db["sales_raw"].count_documents({"processor": "pyflink-pipeline-v1.0"})
+            # Débit = nouveaux messages dans Kafka depuis le dernier snapshot
+            current_offset = get_kafka_end_offsets()
+            elapsed_s      = max((now - last_snapshot_time).total_seconds(), 0.001)
+            new_messages   = max(0, current_offset - last_offset_total)
+            throughput     = round(new_messages / elapsed_s, 2)
 
-            # Débit = nouveaux docs depuis le dernier snapshot
-            new_in_window   = total_processed - last_total
-            elapsed_s       = max((now - last_snapshot_time).total_seconds(), 0.001)
-            throughput      = round(new_in_window / elapsed_s, 2)
+            # Total = offset total = tous les messages jamais envoyés dans Kafka
+            total_processed = current_offset
 
-            # Latence moyenne sur les derniers docs traités
+            # Latence moyenne sur les derniers docs traités par Flink
             recent_docs = list(
                 db["sales_raw"]
                 .find(
@@ -239,7 +261,6 @@ def metrics_writer(db):
 
             # Producteurs actifs via MongoDB heartbeats
             cutoff = datetime.now(timezone.utc).timestamp() - HEARTBEAT_TIMEOUT
-            from datetime import timezone as tz
             active_producers = db["producer_heartbeats"].count_documents({
                 "pipeline": "kafka",
                 "last_seen": {"$gte": datetime.fromtimestamp(cutoff, tz=timezone.utc)},
@@ -265,12 +286,12 @@ def metrics_writer(db):
                               .limit(count - MAX_METRICS_DOCS))
                 db["benchmark_metrics"].delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
 
-            print(f"[PYFLINK] 📈 débit={throughput} msg/s | "
+            print(f"[PYFLINK] 📈 débit={throughput} msg/s (ingestion Kafka) | "
                   f"latence={avg_latency}ms | "
                   f"total={total_processed} | "
                   f"producteurs={active_producers}")
 
-            last_total         = total_processed
+            last_offset_total  = current_offset
             last_snapshot_time = now
 
         except Exception as e:
