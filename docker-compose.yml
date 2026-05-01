@@ -206,7 +206,7 @@ services:
     restart: on-failure
 
   # ───────────────────────────────────────────────────────────────
-  # PRODUCTEUR KAFKA LOCAL — utilise l'image déjà construite
+  # PRODUCTEUR KAFKA LOCAL — désactivé (utiliser producer_kafka/ à la place)
   # ───────────────────────────────────────────────────────────────
   producer:
     image: tp_big_data_kafka_flink-producer:latest
@@ -219,6 +219,8 @@ services:
         condition: service_healthy
     networks:
       - bigdata_net
+    profiles:
+      - disabled
 
 volumes:
   mongodb_data:
