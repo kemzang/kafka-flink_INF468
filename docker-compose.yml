@@ -209,6 +209,7 @@ services:
   # PRODUCTEUR KAFKA LOCAL — utilise l'image déjà construite
   # ───────────────────────────────────────────────────────────────
   producer:
+    build: ./producer
     image: tp_big_data_kafka_flink-producer:latest
     container_name: kafka-producer
     environment:
