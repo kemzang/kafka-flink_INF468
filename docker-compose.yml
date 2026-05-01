@@ -213,9 +213,7 @@ services:
   # PRODUCTEUR KAFKA LOCAL — désactivé (utiliser producer_kafka/ à la place)
   # ───────────────────────────────────────────────────────────────
   producer:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile
+    image: tp_big_data_kafka_flink-producer:latest
     container_name: kafka-producer
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
