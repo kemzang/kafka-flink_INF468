@@ -290,6 +290,11 @@ def main():
         .set_group_id("pyflink-sales-group")
         .set_starting_offsets(KafkaOffsetsInitializer.latest())
         .set_value_only_deserializer(SimpleStringSchema())
+        .set_property("metadata.max.age.ms", "30000")
+        .set_property("request.timeout.ms", "30000")
+        .set_property("socket.connection.setup.timeout.ms", "10000")
+        .set_property("client.dns.lookup", "use_all_dns_ips")
+        .set_property("security.protocol", "PLAINTEXT")
         .build()
     )
 
