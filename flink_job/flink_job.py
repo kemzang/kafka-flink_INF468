@@ -33,7 +33,6 @@ HEARTBEAT_TIMEOUT = 15
 # ─── État partagé ─────────────────────────────────────────────
 class PipelineState:
     def __init__(self):
-        self.lock             = threading.Lock()
         self.total_processed  = 0
         self.messages_lost    = 0
         self.latencies        = []
@@ -42,34 +41,30 @@ class PipelineState:
         self.active_producers = {}
 
     def record_event(self, latency_ms):
-        with self.lock:
-            self.total_processed += 1
-            self.window_count    += 1
-            if latency_ms is not None and latency_ms > 0:
-                self.latencies.append(latency_ms)
+        self.total_processed += 1
+        self.window_count    += 1
+        if latency_ms is not None and latency_ms > 0:
+            self.latencies.append(latency_ms)
 
     def record_loss(self):
-        with self.lock:
-            self.messages_lost += 1
+        self.messages_lost += 1
 
     def record_heartbeat(self, producer_id):
-        with self.lock:
-            self.active_producers[producer_id] = time.time()
+        self.active_producers[producer_id] = time.time()
 
     def flush_window(self):
-        with self.lock:
-            elapsed   = max(time.time() - self.window_start, 0.001)
-            count     = self.window_count
-            latencies = list(self.latencies)
-            total     = self.total_processed
-            lost      = self.messages_lost
-            now       = time.time()
-            active    = {pid: ts for pid, ts in self.active_producers.items()
-                         if now - ts <= HEARTBEAT_TIMEOUT}
-            self.active_producers = active
-            self.window_count     = 0
-            self.latencies        = []
-            self.window_start     = time.time()
+        elapsed   = max(time.time() - self.window_start, 0.001)
+        count     = self.window_count
+        latencies = list(self.latencies)
+        total     = self.total_processed
+        lost      = self.messages_lost
+        now       = time.time()
+        active    = {pid: ts for pid, ts in self.active_producers.items()
+                     if now - ts <= HEARTBEAT_TIMEOUT}
+        self.active_producers = active
+        self.window_count     = 0
+        self.latencies        = []
+        self.window_start     = time.time()
 
         return {
             "pipeline":           PIPELINE,
@@ -108,9 +103,12 @@ def compute_latency(sent_at_str):
 # ─── PyFlink MapFunction ──────────────────────────────────────
 class EnrichEvent(MapFunction):
     def __init__(self, mongo_uri, mongo_db):
-        self.mongo_uri = mongo_uri
-        self.mongo_db  = mongo_db
-        self._db       = None
+        self.mongo_uri  = mongo_uri
+        self.mongo_db   = mongo_db
+        self._db        = None
+        # compteurs locaux (pas de threading.Lock — sérialisables)
+        self._processed = 0
+        self._lost      = 0
 
     def open(self, runtime_context):
         self._db = MongoClient(self.mongo_uri)[self.mongo_db]
@@ -128,7 +126,7 @@ class EnrichEvent(MapFunction):
                 })
             except Exception:
                 pass
-            state.record_loss()
+            self._lost += 1
             return None
 
         total      = event.get("total_amount", 0)
@@ -159,7 +157,7 @@ class EnrichEvent(MapFunction):
                 pass
             print(f"[PYFLINK] 🚨 ALERTE: {total}€ — {event.get('product_name')}")
 
-        state.record_event(latency_ms)
+        self._processed += 1
         lat_str = f"{latency_ms}ms" if latency_ms else "N/A"
         print(f"[PYFLINK] ✅ {event.get('product_name','?')} x{event.get('quantity','?')} "
               f"= {total}€ | latence: {lat_str}")
