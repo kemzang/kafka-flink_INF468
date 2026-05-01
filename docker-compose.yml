@@ -103,10 +103,12 @@ services:
       - bigdata_net
 
   # ───────────────────────────────────────────────────────────────
-  # FLINK JOBMANAGER — utilise l'image locale flink:latest
+  # FLINK JOBMANAGER (coordinateur)
   # ───────────────────────────────────────────────────────────────
   flink-jobmanager:
-    image: flink:latest
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
     container_name: flink-jobmanager
     ports:
       - "8082:8081"
@@ -123,10 +125,12 @@ services:
         condition: service_healthy
 
   # ───────────────────────────────────────────────────────────────
-  # FLINK TASKMANAGER — utilise l'image locale flink:latest
+  # FLINK TASKMANAGER (exécuteur de tâches)
   # ───────────────────────────────────────────────────────────────
   flink-taskmanager:
-    image: flink:latest
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
     container_name: flink-taskmanager
     command: taskmanager
     environment:
@@ -140,15 +144,14 @@ services:
       - flink-jobmanager
 
   # ───────────────────────────────────────────────────────────────
-  # FLINK JOB — utilise l'image producer déjà construite
-  # (contient kafka-python + pymongo)
+  # FLINK JOB — pipeline Kafka → MongoDB
   # ───────────────────────────────────────────────────────────────
   flink-job:
-    image: tp_big_data_kafka_flink-producer:latest
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
     container_name: flink-job
-    command: python3 /app/flink_job.py
-    volumes:
-      - ./flink_job/flink_job.py:/app/flink_job.py
+    command: python3 /opt/flink/usrlib/flink_job.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       MONGO_URI: mongodb://admin:password123@mongodb:27017/
